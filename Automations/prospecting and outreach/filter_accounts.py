@@ -1,31 +1,77 @@
 """
-filter_accounts.py
-------------------
-Filters HubSpot company records against ICP (Ideal Customer Profile) criteria.
-Takes a JSON input file of raw account records and outputs qualified vs excluded accounts.
+filter_accounts.py — Moxo BDR Account Filter
+=============================================
+Applies all 8 SOP rules from sop-rules.md to a list of HubSpot accounts
+and returns qualified accounts + a structured audit log of exclusions.
 
-Input schema:
+USAGE:
+    python scripts/filter_accounts.py <input_json_path> [output_json_path]
+
+    input_json_path  : path to JSON file with accounts to filter
+    output_json_path : path to write filtered results (default: prints to stdout)
+
+INPUT JSON SCHEMA:
 {
-  "accounts": [...],        # list of HubSpot company records
-  "headcount_min": 50,      # rep-specified headcount floor (null = no filter)
-  "headcount_max": 500,     # rep-specified headcount ceiling (null = no filter)
-  "batch_limit": 100        # max accounts to pass through for scoring
+  "rep_name":       "Spencer Johnson",
+  "headcount_min":  50,          // integer, or null if rep said "no preference"
+  "headcount_max":  500,         // integer, or null if rep said "no preference"
+  "batch_limit":    50,          // max accounts to qualify for the scoring pool (default: 50; SKILL.md Step 2 overrides this to 100 to widen the pool for enrichment scoring)
+  "target_batch":   5,           // final batch size — used for pool_exhausted warning (default: 5)
+  "already_researched_this_session": ["Company A", "Company B"],
+  "companies": [
+    {
+      "company_id":          "12345",
+      "company":             "Acme Corp",
+      "website":             "acmecorp.com",
+      "industry":            "Financial Services",
+      "employees":           250,        // integer or range string "201-500", or null
+      "country":             "United States",
+      "is_active_customer":  false,      // bool or null
+      "ai_claude_enriched":  "No",       // "Yes"/"No" or null (HubSpot Yes/No dropdown)
+      "has_open_deal":       false,      // bool — pre-computed from deal stage check
+      "open_deal_stage":     "",         // string — e.g. "Contract Sent"
+      "is_ma_target":        false,      // bool — pre-computed from research
+      "ma_detail":           "",         // string — e.g. "acquisition by NationalLaw Partners"
+      "company_owner":       "Spencer Johnson",
+      "company_owner_b":     ""
+    }
+  ]
 }
 
-Output schema:
+OUTPUT JSON SCHEMA:
 {
-  "qualified": [...],       # accounts that passed all filters
-  "excluded": [...]         # accounts with exclusion reasons logged
+  "qualified": [ { ...company fields + any _note fields added during filtering... } ],
+  "excluded": [
+    {
+      "company":           "Beta Corp",
+      "website":           "betacorp.com",
+      "industry":          "Healthcare",
+      "company_owner":     "Spencer Johnson",
+      "exclusion_reason":  "Excluded — Industry Not in ICP (Healthcare)",
+      "kb_alignment_note": ""
+    }
+  ],
+  "skipped_this_session": ["Company already done"],
+  "summary": {
+    "total_input":      20,
+    "total_qualified":  5,
+    "total_excluded":   14,
+    "total_skipped":    1,
+    "batch_limit":      5,
+    "pool_exhausted":   false,
+    "exclusion_counts": { "Outside Headcount Range": 3, ... }
+  }
 }
-
-Usage:
-    python filter_accounts.py input.json output.json
 """
 
-import json
 import sys
+import json
+import re
+import os
 
-# ── ICP Configuration ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# SOP Constants
+# ---------------------------------------------------------------------------
 
 TARGET_INDUSTRIES = {
     "real estate",
@@ -43,168 +89,368 @@ TARGET_INDUSTRIES = {
     "commercial real estate",
 }
 
+# Industry aliases — maps common variants to in-scope categories
+INDUSTRY_ALIASES = {
+    "mortgage":               "financial services",
+    "lending":                "financial services",
+    "accounting":             "business services",
+    "cpa":                    "business services",
+    "saas":                   "computer software",
+    "software":               "computer software",
+    "consulting":             "business services",
+    "professional services":  "business services",
+    "investment":             "investment management",
+    "wealth management":      "financial services",
+    "private equity":         "investment management",
+    "venture capital":        "investment management",
+    "property management":    "real estate",
+    "construction":           "real estate",
+    "technology":             "it and services",
+    "information technology": "it and services",
+}
+
 NEGATIVE_KEYWORDS = [
-    "university", "school", "college", "non-profit", "nonprofit",
-    "government", "defense", "weapons", ".edu", "school district",
+    "university",
+    "school",
+    "college",
+    "non-profit",
+    "nonprofit",
+    "government",
+    "defense",
+    "weapons",
+    ".edu",
+    "school district",
 ]
 
-GEOGRAPHY_ALLOWLIST = {"united states", "us", "usa", "canada", "ca"}
+IN_SCOPE_COUNTRIES = {
+    "united states",
+    "us",
+    "usa",
+    "u.s.",
+    "u.s.a.",
+    "canada",
+    "ca",
+    "puerto rico",
+    "u.s. virgin islands",
+    "us virgin islands",
+    "north america",   # tentative — flagged in audit note
+}
+
+TENTATIVE_GEOGRAPHY = {"north america"}
 
 
-# ── Filter Functions ───────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def check_headcount(account, headcount_min, headcount_max):
-    """Returns (passed: bool, reason: str)"""
-    if headcount_min is None and headcount_max is None:
-        return True, None
+def normalize(text):
+    return str(text).lower().strip() if text is not None else ""
 
-    employees = account.get("number_of_employees")
-    if employees is None:
-        # Blank headcount: pass through (field-blank handling per SOP)
-        return True, None
 
+def headcount_from_raw(value):
+    """
+    Resolves employees field to an integer.
+    - Range string "201-500" → midpoint 350
+    - Plain integer or numeric string → int
+    - Blank / null / "0" → None (unverified)
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s == "0":
+        return None
+    range_match = re.match(r"^(\d+)\s*[-–]\s*(\d+)$", s)
+    if range_match:
+        lo, hi = int(range_match.group(1)), int(range_match.group(2))
+        return (lo + hi) // 2
     try:
-        employees = int(employees)
-    except (ValueError, TypeError):
-        return True, None
-
-    if headcount_min and employees < headcount_min:
-        return False, f"Excluded — Outside Headcount Range ({employees} employees, rep range {headcount_min}–{headcount_max})"
-    if headcount_max and employees > headcount_max:
-        return False, f"Excluded — Outside Headcount Range ({employees} employees, rep range {headcount_min}–{headcount_max})"
-
-    return True, None
+        v = int(s)
+        return None if v == 0 else v
+    except ValueError:
+        return None
 
 
-def check_geography(account):
-    """Returns (passed: bool, reason: str)"""
-    country = (account.get("country") or "").strip().lower()
-    if country == "":
-        # Blank country: pass through with a note (reviewed at research stage)
-        return True, None
-    if country not in GEOGRAPHY_ALLOWLIST:
-        return False, "Excluded — Outside Geography"
-    return True, None
+def resolve_industry(raw_industry):
+    """
+    Returns (canonical_industry, is_in_scope, alias_used).
+      is_in_scope = True  → in ICP
+      is_in_scope = False → not in ICP, exclude
+      is_in_scope = None  → blank field, don't exclude but flag
+    """
+    if not raw_industry or not raw_industry.strip():
+        return (raw_industry, None, None)
+
+    norm = normalize(raw_industry)
+
+    if norm in TARGET_INDUSTRIES:
+        return (raw_industry, True, None)
+
+    for alias_key, canonical in INDUSTRY_ALIASES.items():
+        if alias_key in norm:
+            return (canonical, True, alias_key)
+
+    return (raw_industry, False, None)
 
 
-def check_active_customer(account):
-    """Returns (passed: bool, reason: str)"""
-    status = (account.get("is_active_customer") or "").strip().lower()
-    if status == "yes":
-        return False, "Excluded — Active Customer"
-    return True, None
-
-
-def check_already_enriched(account):
-    """Returns (passed: bool, reason: str)"""
-    enriched = (account.get("ai_claude_enriched") or "").strip().lower()
-    if enriched == "yes":
-        return False, "Excluded — Already Enriched"
-    return True, None
-
-
-def check_open_deals(account):
-    """Returns (passed: bool, reason: str)"""
-    open_deals = account.get("associated_open_deals", 0)
-    try:
-        if int(open_deals) > 0:
-            return False, "Excluded — Open Deal in Progress"
-    except (ValueError, TypeError):
-        pass
-    return True, None
-
-
-def check_industry(account):
-    """Returns (passed: bool, reason: str)"""
-    industry = (account.get("industry") or "").strip().lower()
-    if industry == "":
-        # Blank industry: pass through (will be assessed in research stage)
-        return True, None
-    if industry not in TARGET_INDUSTRIES:
-        return False, "Excluded — Industry Not in ICP"
-    return True, None
-
-
-def check_negative_keywords(account):
-    """Returns (passed: bool, reason: str)"""
-    fields_to_check = [
-        account.get("company_name", ""),
-        account.get("industry", ""),
-        account.get("domain", ""),
-    ]
-    combined = " ".join(f.lower() for f in fields_to_check if f)
+def check_negative_keywords(company_name, industry, website):
+    """Returns the first matched keyword, or None if clean."""
+    targets = [normalize(company_name), normalize(industry), normalize(website)]
     for keyword in NEGATIVE_KEYWORDS:
-        if keyword in combined:
-            return False, f"Excluded — Negative Keyword Match ({keyword})"
-    return True, None
+        for target in targets:
+            if keyword in target:
+                return keyword
+    return None
 
 
-# ── Main Filter Pipeline ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Per-account filter
+# ---------------------------------------------------------------------------
 
-FILTERS = [
-    ("headcount", lambda a, cfg: check_headcount(a, cfg.get("headcount_min"), cfg.get("headcount_max"))),
-    ("geography", lambda a, cfg: check_geography(a)),
-    ("active_customer", lambda a, cfg: check_active_customer(a)),
-    ("already_enriched", lambda a, cfg: check_already_enriched(a)),
-    ("open_deals", lambda a, cfg: check_open_deals(a)),
-    ("industry", lambda a, cfg: check_industry(a)),
-    ("negative_keywords", lambda a, cfg: check_negative_keywords(a)),
-]
+def filter_account(company, headcount_min, headcount_max, already_researched):
+    """
+    Returns:
+        ("qualified", None, None)
+        ("excluded", exclusion_reason_str, kb_alignment_note_or_None)
+        ("skip",     reason_str,           None)
+    """
+    name     = company.get("company", "")
+    website  = company.get("website", "") or ""
+    industry = company.get("industry", "") or ""
+    country  = company.get("country", "") or ""
+    raw_emp  = company.get("employees")
 
+    # In-session dedup
+    if name in already_researched:
+        return ("skip", f"Already researched this session — {name}", None)
 
-def filter_accounts(input_data: dict) -> dict:
-    accounts = input_data.get("accounts", [])
-    batch_limit = input_data.get("batch_limit", 100)
-
-    qualified = []
-    excluded = []
-
-    for account in accounts:
-        exclude_reason = None
-
-        for filter_name, filter_fn in FILTERS:
-            passed, reason = filter_fn(account, input_data)
-            if not passed:
-                exclude_reason = reason
-                break
-
-        if exclude_reason:
-            excluded.append({
-                **account,
-                "exclusion_reason": exclude_reason,
-            })
+    # --- Rule 1: Headcount ---
+    if headcount_min is not None or headcount_max is not None:
+        emp = headcount_from_raw(raw_emp)
+        if emp is None:
+            company["_headcount_note"] = (
+                "Headcount unverified — included for research (blank or zero in HubSpot)"
+            )
         else:
-            qualified.append(account)
+            too_small = headcount_min is not None and emp < headcount_min
+            too_large = headcount_max is not None and emp > headcount_max
+            if too_small or too_large:
+                lo = headcount_min if headcount_min is not None else "any"
+                hi = headcount_max if headcount_max is not None else "any"
+                return (
+                    "excluded",
+                    f"Excluded — Outside Headcount Range ({emp} employees, rep range {lo}–{hi})",
+                    None,
+                )
 
+    # --- Rule 2: Geography ---
+    norm_country = normalize(country)
+    if not norm_country:
+        domain_lower = normalize(website)
+        if domain_lower.endswith(".ca"):
+            company["_geo_note"] = "Geography unverified — assumed Canada based on .ca domain"
+        else:
+            company["_geo_note"] = (
+                "Geography unverified — assumed US based on .com domain or blank field; "
+                "verify during research"
+            )
+    elif norm_country not in IN_SCOPE_COUNTRIES:
+        return ("excluded", f"Excluded — Outside Geography (HQ in {country})", None)
+    elif norm_country in TENTATIVE_GEOGRAPHY:
+        company["_geo_note"] = (
+            "Geography listed as 'North America' — verify specific country during research"
+        )
+
+    # --- Rule 3: Active Customer ---
+    # HubSpot property "Is an Active customer?" is any of Yes → exclude
+    is_customer = company.get("is_active_customer")
+    if is_customer is True:
+        return ("excluded", "Excluded — Active Customer", None)
+
+    # --- Rule 4: Already Enriched ---
+    enriched = company.get("ai_claude_enriched")
+    if str(enriched).lower() == "yes":
+        return (
+            "excluded",
+            "Excluded — Already Enriched (AI Claude Enriched flag = yes in HubSpot)",
+            None,
+        )
+
+    # --- Rule 5: Open Deal ---
+    has_open_deal = company.get("has_open_deal")
+    if has_open_deal is True:
+        deal_stage = company.get("open_deal_stage") or "stage unrecognized, treated as active"
+        return (
+            "excluded",
+            f"Excluded — Open Deal in Progress ({deal_stage})",
+            None,
+        )
+
+    # --- Rule 6: M&A Target ---
+    is_ma = company.get("is_ma_target")
+    if is_ma is True:
+        ma_detail = company.get("ma_detail") or "acquisition or merger in progress"
+        return ("excluded", f"Excluded — M&A Target ({ma_detail})", None)
+
+    # --- Rule 7: Target Industries ---
+    canonical_industry, is_in_scope, alias_used = resolve_industry(industry)
+    if is_in_scope is False:
+        return ("excluded", f"Excluded — Industry Not in ICP ({industry})", None)
+    if is_in_scope is None:
+        company["_industry_note"] = (
+            "Industry blank in HubSpot — infer from website during research"
+        )
+    if alias_used:
+        company["_industry_note"] = (
+            f"Industry '{industry}' mapped to '{canonical_industry}' via alias — "
+            "confirm during research"
+        )
+
+    # --- Rule 8: Negative Keywords ---
+    matched_keyword = check_negative_keywords(name, industry, website)
+    if matched_keyword:
+        return (
+            "excluded",
+            f"Excluded — Negative Keyword Match ('{matched_keyword}' found in name/industry/domain)",
+            None,
+        )
+
+    return ("qualified", None, None)
+
+
+# ---------------------------------------------------------------------------
+# Main filter runner
+# ---------------------------------------------------------------------------
+
+def run_filter(data):
+    headcount_min = data.get("headcount_min")
+    headcount_max = data.get("headcount_max")
+    batch_limit   = int(data.get("batch_limit", 50))   # scoring pool size
+    target_batch  = int(data.get("target_batch", 5))   # final batch target for pool_exhausted check
+    already_done  = set(data.get("already_researched_this_session", []))
+    companies     = data.get("companies", [])
+
+    qualified        = []
+    excluded         = []
+    skipped          = []
+    exclusion_counts = {}
+
+    for company in companies:
         if len(qualified) >= batch_limit:
             break
 
+        result, reason, note = filter_account(
+            company, headcount_min, headcount_max, already_done
+        )
+
+        if result == "qualified":
+            qualified.append(company)
+
+        elif result == "excluded":
+            # Extract short category label for the counts summary
+            cat = (
+                reason.split("—")[1].strip().split("(")[0].strip()
+                if "—" in reason
+                else reason
+            )
+            exclusion_counts[cat] = exclusion_counts.get(cat, 0) + 1
+            excluded.append(
+                {
+                    "company":           company.get("company", ""),
+                    "website":           company.get("website", ""),
+                    "industry":          company.get("industry", ""),
+                    "company_owner":     company.get("company_owner", ""),
+                    "exclusion_reason":  reason,
+                    "kb_alignment_note": note or "",
+                }
+            )
+
+        elif result == "skip":
+            skipped.append(company.get("company", ""))
+
+    # pool_exhausted means we couldn't fill the final target batch (not the scoring pool)
+    pool_exhausted = len(qualified) < target_batch and len(companies) > 0
+
     return {
-        "qualified": qualified,
-        "excluded": excluded,
+        "qualified":               qualified,
+        "excluded":                excluded,
+        "skipped_this_session":    skipped,
         "summary": {
-            "total_input": len(accounts),
-            "qualified": len(qualified),
-            "excluded": len(excluded),
-        }
+            "total_input":      len(companies),
+            "total_qualified":  len(qualified),
+            "total_excluded":   len(excluded),
+            "total_skipped":    len(skipped),
+            "batch_limit":      batch_limit,
+            "target_batch":     target_batch,
+            "pool_exhausted":   pool_exhausted,
+            "exclusion_counts": exclusion_counts,
+        },
     }
 
 
-# ── CLI Entry Point ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python filter_accounts.py input.json output.json")
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+
+    input_path  = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if not os.path.exists(input_path):
+        print(f"ERROR: Input file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    input_path, output_path = sys.argv[1], sys.argv[2]
+    with open(input_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    with open(input_path, "r") as f:
-        input_data = json.load(f)
+    result       = run_filter(data)
+    output_json  = json.dumps(result, indent=2, ensure_ascii=False)
 
-    result = filter_accounts(input_data)
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(output_json)
+        print(f"Filter complete → {output_path}", file=sys.stderr)
+    else:
+        print(output_json)
 
-    with open(output_path, "w") as f:
-        json.dump(result, f, indent=2)
+    _print_summary(result["summary"])
+    sys.exit(0 if result["summary"]["total_qualified"] > 0 else 1)
 
-    print(f"Filter complete: {result['summary']['qualified']} qualified, {result['summary']['excluded']} excluded")
+
+def _print_summary(summary):
+    sep = "─" * 38
+    lines = [
+        "",
+        sep,
+        " Filter Summary",
+        sep,
+        f"  Input      : {summary['total_input']} accounts",
+        f"  Qualified  : {summary['total_qualified']}  (scoring pool limit: {summary['batch_limit']}, target batch: {summary['target_batch']})",
+        f"  Excluded   : {summary['total_excluded']}",
+        f"  Skipped    : {summary['total_skipped']}  (already done this session)",
+    ]
+    if summary["exclusion_counts"]:
+        lines.append("")
+        lines.append("  Exclusion breakdown:")
+        for reason, count in sorted(
+            summary["exclusion_counts"].items(), key=lambda x: -x[1]
+        ):
+            lines.append(f"    {reason}: {count}")
+    if summary["pool_exhausted"]:
+        lines.append("")
+        lines.append(
+            f"  ⚠  Pool exhausted — only {summary['total_qualified']} of "
+            f"{summary['target_batch']} target accounts qualified."
+        )
+        lines.append(
+            "     Suggest: expand headcount range or check for newly assigned accounts."
+        )
+    lines.append(sep)
+    print("\n".join(lines), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

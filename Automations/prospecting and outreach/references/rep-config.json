@@ -1,0 +1,16 @@
+{
+  "_comment": "Rep routing configuration for prospecting-and-outreach skill. Edit this file to update rep-specific behavior without touching SKILL.md.",
+
+  "dual_owner_reps": [
+    {
+      "name": "Spencer Johnson",
+      "note": "Also search Company Owner B for this rep"
+    },
+    {
+      "name": "Jay Sadoff",
+      "note": "Also search Company Owner B for this rep"
+    }
+  ],
+
+  "_instructions": "dual_owner_reps: Reps listed here trigger an additional HubSpot search on the Company Owner B field. Their full name must match exactly (case-sensitive). All other reps use Company Owner only."
+}
